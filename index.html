@@ -14,7 +14,10 @@
       <p class="sub">随时随地在手机/电脑上和朋友一起玩</p>
       <input id="nameInput" maxlength="12" placeholder="输入你的昵称" />
       <div class="row">
-        <input id="codeInput" maxlength="4" placeholder="房间号（加入时填）" />
+        <input id="roomNameInput" maxlength="20" placeholder="房间名（可选，自己起名更好记）" />
+      </div>
+      <div class="row">
+        <input id="codeInput" maxlength="20" placeholder="房间号（加入时填）" />
       </div>
       <div class="row bot-cfg">
         <label>机器人性格（仅单人模式生效）
@@ -34,8 +37,8 @@
       <p id="lobbyMsg" class="msg"></p>
       <p class="tip">
         • <b>单人模式</b>：只有你和机器人，轮流作画 / 猜词，一个人也能玩 🤖（无需联网）<br/>
-        • <b>创建房间(多人)</b>：纯多人，不会有机器人，把房间号发给朋友即可。<br/>
-        • <b>加入房间</b>：输入朋友给的房间号进入。<br/>
+        • <b>创建房间(多人)</b>：纯多人，不会有机器人；可在昵称下自定义<b>房间名</b>，创建后点顶栏 🔗 复制邀请链接发给朋友。<br/>
+        • <b>加入房间</b>：直接打开朋友发来的邀请链接，房间号会自动填好，输入昵称即可进。<br/>
         • 网站托管在 GitHub Pages，<b>永远在线</b>，手机电脑都能直接打开。
       </p>
     </div>
@@ -44,7 +47,7 @@
   <!-- 游戏主界面 -->
   <div id="game" class="screen hidden">
     <header class="topbar">
-      <div class="room">房间 <b id="roomCode">----</b></div>
+      <div class="room">房间 <b id="roomCode">----</b><button id="inviteBtn" class="mini hidden" title="复制邀请链接">🔗 邀请</button></div>
       <div class="round" id="roundInfo">等待开始</div>
       <div class="timer" id="timer">--</div>
     </header>
@@ -95,6 +98,8 @@
       </aside>
     </div>
   </div>
+
+  <div id="toast" class="toast hidden"></div>
 
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <script src="words.js"></script>
