@@ -59,6 +59,9 @@ let roomCode = null;
 let myId = null;
 const peers = new Map();  // 房主侧：peerId -> { conn, name }
 const pending = new Map(); // 房主侧：待确认加入的 peerId -> name（收到 joinConfirm 才真正进房）
+let peerWatch = null;      // 房主侧：信令断线守护定时器
+let connSeq = 0;           // 玩家侧：连接序号，忽略过期连接的事件
+let joinRetries = 0;       // 玩家侧：peer-unavailable 自动重试次数
 
 // ---- 房主侧房间状态 ----
 let room = null;
@@ -134,6 +137,7 @@ function backToLobby(msg) {
   isHost = false; roomCode = null; myId = null; room = null;
   try { if (hostConn) { hostConn.close(); hostConn = null; } } catch (e) {}
   try { if (peer) { peer.destroy(); peer = null; } } catch (e) {}
+  if (peerWatch) { clearInterval(peerWatch); peerWatch = null; }
   inviteBtn.classList.add("hidden");
   roomNameInput.value = "";
 }
@@ -211,27 +215,62 @@ $("joinBtn").addEventListener("click", () => {
 let pendingName = null;
 let joinConfirmed = false;
 function joinAsPlayer(name, code) {
-  roomCode = code; isHost = false; me.isHost = false; pendingName = name; joinConfirmed = false;
+  roomCode = code; isHost = false; me.isHost = false; pendingName = name; joinConfirmed = false; joinRetries = 0;
   lobbyMsg.textContent = "正在连接房主，请稍候…";
   // 两秒弹窗提示：正在加入的房间名，并说明只需房间码或房主链接
   showToast("正在加入房间「" + code + "」…<br>只需房间码，或打开房主发的邀请链接即可进入。", 2000);
   peer = new Peer();
   peer.on("open", (id) => {
     myId = id; me.id = id;
-    const hostId = "drawguess-" + code;
-    hostConn = peer.connect(hostId, { reliable: true });
-    hostConn.on("open", () => { sendHello(); });   // 首包，可能丢失
-    hostConn.on("data", dispatch);
-    hostConn.on("close", () => backToLobby("与房主的连接已断开，请重新加入。"));
-    hostConn.on("error", () => { lobbyMsg.textContent = "连接失败：请确认房间号正确，且房主页面没有关闭。"; });
-    // 兜底：长时间没进入游戏（没收到房主状态，且确认框未打开）则提示
+    connectToHost(code);
+    // 兜底：长时间没进入游戏（没收到房主状态，且确认框未打开、无重试中）则提示
     setTimeout(() => {
       if (!game.classList.contains("hidden")) return;
       if (!joinModal.classList.contains("hidden")) return;
+      if (joinRetries > 0) return; // 已有错误/重试提示，不覆盖
       lobbyMsg.textContent = "连接超时：请确认房主页面还开着，或换一个房间号重试。";
-    }, 9000);
+    }, 15000);
   });
-  peer.on("error", (e) => { lobbyMsg.textContent = "连接错误：" + (e && e.type ? e.type : e); });
+  // 信令断线自动重连（服务器把房间"弄丢"多半是这个原因）
+  peer.on("disconnected", () => {
+    try { if (peer && !peer.destroyed) peer.reconnect(); } catch (e) {}
+  });
+  peer.on("error", (e) => handleJoinError(e, code));
+}
+function connectToHost(code) {
+  if (!peer || peer.destroyed) return;
+  const seq = ++connSeq;
+  const hostId = "drawguess-" + code;
+  try { hostConn = peer.connect(hostId, { reliable: true }); } catch (e) { return; }
+  hostConn.on("open", () => { if (seq !== connSeq) return; sendHello(); });
+  hostConn.on("data", dispatch);
+  hostConn.on("close", () => {
+    if (seq !== connSeq) return;
+    backToLobby("与房主的连接已断开，请重新加入。");
+  });
+  hostConn.on("error", () => {});
+}
+// 玩家侧连接错误处理：peer-unavailable 自动重试，之后给出清晰排查提示
+function handleJoinError(e, code) {
+  const type = e && e.type ? e.type : String(e || "unknown");
+  if (type === "peer-unavailable") {
+    if (joinRetries < 2) {
+      joinRetries++;
+      lobbyMsg.textContent = "没找到房间，正在重试（" + joinRetries + "/2）…";
+      setTimeout(() => {
+        if (!peer || peer.destroyed) return;
+        if (peer.open) connectToHost(code);
+        else { try { peer.reconnect(); } catch (err) {} }
+      }, 2500);
+      return;
+    }
+    lobbyMsg.innerHTML = "❌ 找不到房间「" + escapeHtml(code) + "」，请依次检查：<br>" +
+      "1️⃣ 房主的页面还开着吗？（房主关了页面，房间就没了）<br>" +
+      "2️⃣ 房间号和房主顶栏显示的<b>完全一致</b>吗？（区分大小写，建议直接点房主发的 🔗 邀请链接进入，别手输）<br>" +
+      "3️⃣ 都没问题的话，让房主刷新页面重建一个房间再试。";
+    return;
+  }
+  lobbyMsg.textContent = "连接错误：" + type + "。请检查网络后重试。";
 }
 // 向房主报到（房主收到 welcome 后会再次触发，确保首包不丢）
 function sendHello() {
@@ -281,6 +320,14 @@ function createHost(code, name, mode, personality) {
   showInviteLink(code);
   try { peer = new Peer(myId); } catch (e) { lobbyMsg.textContent = "无法创建房间，请重试。"; return; }
   peer.on("open", () => {});
+  // 信令断线自动重连：否则房间会从服务器"消失"，朋友就会报 peer-unavailable
+  peer.on("disconnected", () => {
+    try { if (peer && !peer.destroyed) peer.reconnect(); } catch (e) {}
+  });
+  clearInterval(peerWatch);
+  peerWatch = setInterval(() => {
+    if (peer && peer.disconnected && !peer.destroyed) { try { peer.reconnect(); } catch (e) {} }
+  }, 10000);
   peer.on("connection", (conn) => {
     peers.set(conn.peer, { conn, name: null });   // 关键：登记连接，broadcast 才能发得出去
     const sendWelcome = () => { if (conn.open) conn.send({ t: "welcome" }); };
@@ -573,6 +620,7 @@ function hostDissolve() {
   broadcastToAll({ t: "roomDissolved" });
   room = null;
   try { if (peer) peer.destroy(); } catch (e) {}
+  if (peerWatch) { clearInterval(peerWatch); peerWatch = null; }
   backToLobby("房间已解散。");
 }
 
