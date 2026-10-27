@@ -37,6 +37,11 @@ const dissolveBtn = $("dissolveBtn");
 const exitBtn = $("exitBtn");
 const roundsSelect = $("roundsSelect");
 const botPersonalitySel = $("botPersonality");
+const joinModal = $("joinModal");
+const joinRoomNameEl = $("joinRoomName");
+const joinMembersEl = $("joinMembers");
+const joinAcceptBtn = $("joinAcceptBtn");
+const joinRejectBtn = $("joinRejectBtn");
 
 // ---- 通用状态 ----
 let me = { id: null, isDrawer: false, isHost: false };
@@ -53,6 +58,7 @@ let isHost = false;
 let roomCode = null;
 let myId = null;
 const peers = new Map();  // 房主侧：peerId -> { conn, name }
+const pending = new Map(); // 房主侧：待确认加入的 peerId -> name（收到 joinConfirm 才真正进房）
 
 // ---- 房主侧房间状态 ----
 let room = null;
@@ -163,11 +169,11 @@ function fallbackCopy(text, ok) {
   }
 }
 let toastTimer = null;
-function showToast(html) {
+function showToast(html, ms) {
   toastEl.innerHTML = html;
   toastEl.classList.remove("hidden");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toastEl.classList.add("hidden"), 4000);
+  toastTimer = setTimeout(() => toastEl.classList.add("hidden"), ms || 4000);
 }
 inviteBtn.addEventListener("click", copyInvite);
 
@@ -203,9 +209,12 @@ $("joinBtn").addEventListener("click", () => {
 
 // ---- 玩家：连接房主 ----
 let pendingName = null;
+let joinConfirmed = false;
 function joinAsPlayer(name, code) {
-  roomCode = code; isHost = false; me.isHost = false; pendingName = name;
+  roomCode = code; isHost = false; me.isHost = false; pendingName = name; joinConfirmed = false;
   lobbyMsg.textContent = "正在连接房主，请稍候…";
+  // 两秒弹窗提示：正在加入的房间名，并说明只需房间码或房主链接
+  showToast("正在加入房间「" + code + "」…<br>只需房间码，或打开房主发的邀请链接即可进入。", 2000);
   peer = new Peer();
   peer.on("open", (id) => {
     myId = id; me.id = id;
@@ -215,9 +224,10 @@ function joinAsPlayer(name, code) {
     hostConn.on("data", dispatch);
     hostConn.on("close", () => backToLobby("与房主的连接已断开，请重新加入。"));
     hostConn.on("error", () => { lobbyMsg.textContent = "连接失败：请确认房间号正确，且房主页面没有关闭。"; });
-    // 兜底：长时间没进入游戏（没收到房主状态）则提示
+    // 兜底：长时间没进入游戏（没收到房主状态，且确认框未打开）则提示
     setTimeout(() => {
       if (!game.classList.contains("hidden")) return;
+      if (!joinModal.classList.contains("hidden")) return;
       lobbyMsg.textContent = "连接超时：请确认房主页面还开着，或换一个房间号重试。";
     }, 9000);
   });
@@ -227,6 +237,28 @@ function joinAsPlayer(name, code) {
 function sendHello() {
   if (hostConn && hostConn.open) hostConn.send({ t: "hello", name: pendingName });
 }
+// 房主回传房间信息 -> 弹出加入确认框（含房间名 + 成员名单）
+function showJoinConfirm(roomName, members) {
+  joinRoomNameEl.textContent = roomName || roomCode || "----";
+  joinMembersEl.innerHTML = "";
+  (members && members.length ? members : ["（暂无其他成员）"]).forEach((n) => {
+    const li = document.createElement("li");
+    li.textContent = n;
+    joinMembersEl.appendChild(li);
+  });
+  joinModal.classList.remove("hidden");
+}
+joinAcceptBtn.addEventListener("click", () => {
+  joinModal.classList.add("hidden");
+  joinConfirmed = true;
+  if (hostConn && hostConn.open) hostConn.send({ t: "joinConfirm" });
+});
+joinRejectBtn.addEventListener("click", () => {
+  joinModal.classList.add("hidden");
+  backToLobby("你已取消加入该房间。");
+  try { if (hostConn) hostConn.close(); } catch (e) {}
+  try { if (peer) peer.destroy(); } catch (e) {}
+});
 
 // ---- 房主：创建房间 ----
 function createHost(code, name, mode, personality) {
@@ -280,9 +312,27 @@ function onHostMessage(d, conn) {
         if (conn.open) conn.send({ t: "state", ...buildView(pid) });
         return;
       }
+      // 先不进房：把房间名 + 现有成员发回，等玩家点「加入」确认（确保进对房间）
+      pending.set(pid, name);
+      if (conn.open) conn.send({ t: "roomInfo", roomName: room.code, members: room.players.map((p) => p.name) });
+      break;
+    }
+    case "joinConfirm": {
+      if (!pending.has(pid)) {
+        if (room.players.some((p) => p.id === pid) && conn.open) conn.send({ t: "state", ...buildView(pid) });
+        break;
+      }
+      const name = pending.get(pid);
+      pending.delete(pid);
+      if (room.players.some((p) => p.id === pid)) break;
       room.players.push({ id: pid, name, score: 0, correct: false });
       chatHost(name, "加入了房间", "join");
       broadcastStateHost();
+      break;
+    }
+    case "joinReject": {
+      pending.delete(pid);
+      try { if (conn.open) conn.close(); } catch (e) {}
       break;
     }
     case "start": if (pid === room.hostId) startGame(parseInt(d.rounds, 10)); break;
@@ -528,6 +578,7 @@ function hostDissolve() {
 
 function handleDisconnect(pid, voluntary) {
   if (!room) return;
+  pending.delete(pid);
   const idx = room.players.findIndex((p) => p.id === pid);
   if (idx < 0) return;
   const [left] = room.players.splice(idx, 1);
@@ -640,6 +691,7 @@ function botEmitDraw(seg) {
 function dispatch(m) {
   switch (m.t) {
     case "welcome": sendHello(); break;   // 房主已就绪，补发报到，确保首包不丢
+    case "roomInfo": showJoinConfirm(m.roomName, m.members); break;  // 弹出加入确认框
     case "state": applyState(m); break;
     case "yourWord": applyYourWord(m); break;
     case "draw": stroke(m.seg.from, m.seg.to, m.seg.color, m.seg.size); break;
@@ -655,6 +707,7 @@ function dispatch(m) {
 }
 
 function applyState(s) {
+  joinModal.classList.add("hidden");
   me.isDrawer = s.youAreDrawer;
   me.isHost = s.hostId === me.id;
   if (!lobby.classList.contains("hidden")) { lobby.classList.add("hidden"); game.classList.remove("hidden"); }
