@@ -202,20 +202,30 @@ $("joinBtn").addEventListener("click", () => {
 });
 
 // ---- 玩家：连接房主 ----
+let pendingName = null;
 function joinAsPlayer(name, code) {
-  roomCode = code; isHost = false; me.isHost = false;
-  enterGameScreen();
+  roomCode = code; isHost = false; me.isHost = false; pendingName = name;
+  lobbyMsg.textContent = "正在连接房主，请稍候…";
   peer = new Peer();
   peer.on("open", (id) => {
     myId = id; me.id = id;
     const hostId = "drawguess-" + code;
     hostConn = peer.connect(hostId, { reliable: true });
-    hostConn.on("open", () => { hostConn.send({ t: "hello", name }); });
+    hostConn.on("open", () => { sendHello(); });   // 首包，可能丢失
     hostConn.on("data", dispatch);
     hostConn.on("close", () => backToLobby("与房主的连接已断开，请重新加入。"));
-    hostConn.on("error", () => { lobbyMsg.textContent = "连接失败，请确认房间号是否正确。"; });
+    hostConn.on("error", () => { lobbyMsg.textContent = "连接失败：请确认房间号正确，且房主页面没有关闭。"; });
+    // 兜底：长时间没进入游戏（没收到房主状态）则提示
+    setTimeout(() => {
+      if (!game.classList.contains("hidden")) return;
+      lobbyMsg.textContent = "连接超时：请确认房主页面还开着，或换一个房间号重试。";
+    }, 9000);
   });
   peer.on("error", (e) => { lobbyMsg.textContent = "连接错误：" + (e && e.type ? e.type : e); });
+}
+// 向房主报到（房主收到 welcome 后会再次触发，确保首包不丢）
+function sendHello() {
+  if (hostConn && hostConn.open) hostConn.send({ t: "hello", name: pendingName });
 }
 
 // ---- 房主：创建房间 ----
@@ -240,6 +250,10 @@ function createHost(code, name, mode, personality) {
   try { peer = new Peer(myId); } catch (e) { lobbyMsg.textContent = "无法创建房间，请重试。"; return; }
   peer.on("open", () => {});
   peer.on("connection", (conn) => {
+    peers.set(conn.peer, { conn, name: null });   // 关键：登记连接，broadcast 才能发得出去
+    const sendWelcome = () => { if (conn.open) conn.send({ t: "welcome" }); };
+    if (conn.open) sendWelcome();
+    conn.on("open", sendWelcome);
     conn.on("data", (d) => onHostMessage(d, conn));
     conn.on("close", () => handleDisconnect(conn.peer, false));
     conn.on("error", () => {});
@@ -261,6 +275,7 @@ function onHostMessage(d, conn) {
   switch (d.t) {
     case "hello": {
       const name = String(d.name || "玩家").slice(0, 12) || "玩家";
+      if (peers.has(pid)) peers.get(pid).name = name;
       if (room.players.some((p) => p.id === pid)) {
         if (conn.open) conn.send({ t: "state", ...buildView(pid) });
         return;
@@ -624,6 +639,7 @@ function botEmitDraw(seg) {
 // ---- 玩家 / 房主通用：接收消息 ----
 function dispatch(m) {
   switch (m.t) {
+    case "welcome": sendHello(); break;   // 房主已就绪，补发报到，确保首包不丢
     case "state": applyState(m); break;
     case "yourWord": applyYourWord(m); break;
     case "draw": stroke(m.seg.from, m.seg.to, m.seg.color, m.seg.size); break;
