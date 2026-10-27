@@ -1,16 +1,13 @@
 {
   "name": "draw-guess",
   "version": "1.0.0",
-  "description": "你画我猜 - 5人联网休闲小游戏",
-  "main": "server.js",
+  "description": "你画我猜 - 纯静态 P2P 多人联机小游戏（部署于 GitHub Pages）",
+  "private": true,
   "scripts": {
-    "start": "node server.js"
+    "start": "node serve.js",
+    "serve": "node serve.js"
   },
   "engines": {
-    "node": ">=20.0.0"
-  },
-  "dependencies": {
-    "express": "^4.19.2",
-    "socket.io": "^4.7.5"
+    "node": ">=18"
   }
 }
