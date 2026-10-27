@@ -99,6 +99,20 @@
     </div>
   </div>
 
+  <!-- 加入房间确认弹窗 -->
+  <div id="joinModal" class="modal-mask hidden">
+    <div class="modal">
+      <h3>加入房间确认</h3>
+      <p class="modal-room">房间：<b id="joinRoomName">----</b></p>
+      <p class="modal-sub">房间内成员（确认是不是对的房间）：</p>
+      <ul id="joinMembers" class="join-members"></ul>
+      <div class="modal-btns">
+        <button id="joinRejectBtn" class="ghost">拒绝</button>
+        <button id="joinAcceptBtn" class="primary">加入</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
 
   <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
