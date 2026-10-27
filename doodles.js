@@ -1,6 +1,6 @@
 // 机器人"反画"用的简笔画库。
 // 每个词条返回一组折线（polyline），每条折线是 [{x,y}, ...]，坐标范围约 0~1（会被前端缩放铺满画布）。
-// 笔画由服务端按段 emit，营造"机器人正在画"的渐进效果。
+// 笔画由房主（模拟机器人作画）按段下发，营造"机器人正在画"的渐进效果。
 
 function circle(cx, cy, r, steps = 28, a0 = 0, a1 = Math.PI * 2) {
   const p = [];
@@ -234,4 +234,7 @@ function getDoodle(word) {
   return fn ? fn() : null;
 }
 
-module.exports = { getDoodle, DOODLE_WORDS: Object.keys(D) };
+const DOODLE_WORDS = Object.keys(D);
+
+if (typeof module !== "undefined" && module.exports) module.exports = { getDoodle, DOODLE_WORDS };
+if (typeof window !== "undefined") { window.getDoodle = getDoodle; window.DOODLE_WORDS = DOODLE_WORDS; }
