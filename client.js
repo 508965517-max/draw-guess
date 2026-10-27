@@ -121,6 +121,18 @@ function genCode() {
 function normalizeRoom(s) {
   return String(s || "").trim().replace(/\s+/g, "").slice(0, 20);
 }
+// 信令服务器只接受字母/数字的 ID，中文房间号直接注册会被拒（房间"隐身"）。
+// 因此用房间名的稳定哈希生成底层 ID：房主和加入者对同一房间名算出同一 ID。
+function hostIdFor(code) {
+  const s = "drawguess|" + code;
+  let h1 = 0x811c9dc5, h2 = 0x01000193;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 16777619) >>> 0;
+    h2 = Math.imul(h2 ^ (c + i), 2246822519) >>> 0;
+  }
+  return "dg-" + h1.toString(16) + h2.toString(16);
+}
 function enterGameScreen() {
   lobby.classList.add("hidden");
   game.classList.remove("hidden");
@@ -240,7 +252,7 @@ function joinAsPlayer(name, code) {
 function connectToHost(code) {
   if (!peer || peer.destroyed) return;
   const seq = ++connSeq;
-  const hostId = "drawguess-" + code;
+  const hostId = hostIdFor(code);
   try { hostConn = peer.connect(hostId, { reliable: true }); } catch (e) { return; }
   hostConn.on("open", () => { if (seq !== connSeq) return; sendHello(); });
   hostConn.on("data", dispatch);
@@ -302,7 +314,8 @@ joinRejectBtn.addEventListener("click", () => {
 // ---- 房主：创建房间 ----
 function createHost(code, name, mode, personality) {
   isHost = true; me.isHost = true;
-  me.id = "drawguess-" + code; myId = me.id; roomCode = code;
+  const pid = hostIdFor(code);   // 底层 ID 用哈希，中文房间名也能注册
+  me.id = pid; myId = pid; roomCode = code;
   room = makeRoom(code);
   room.solo = mode === "solo";
   if (personality === "instant" || personality === "chatty") room.botPersonality = personality;
@@ -318,8 +331,8 @@ function createHost(code, name, mode, personality) {
   }
   // 多人：建立可连接的 Peer，等待朋友加入
   showInviteLink(code);
-  try { peer = new Peer(myId); } catch (e) { lobbyMsg.textContent = "无法创建房间，请重试。"; return; }
-  peer.on("open", () => {});
+  try { peer = new Peer(pid); } catch (e) { lobbyMsg.textContent = "无法创建房间，请重试。"; return; }
+  peer.on("open", () => { showToast("✅ 房间已就绪，朋友可通过邀请链接或房间号加入了。", 3500); });
   // 信令断线自动重连：否则房间会从服务器"消失"，朋友就会报 peer-unavailable
   peer.on("disconnected", () => {
     try { if (peer && !peer.destroyed) peer.reconnect(); } catch (e) {}
@@ -480,6 +493,7 @@ function buildView(forId) {
     hostId: room.hostId, drawerId: room.drawerId, drawerName: drawerName(),
     phase: room.phase, round: room.round, totalRounds: room.totalRounds,
     timeLeft: room.timeLeft, started: room.started, youAreDrawer: isDrawer,
+    solo: !!room.solo,
     word: isDrawer ? room.word : null,
     wordLen: room.word ? room.word.length : 0, wordCategory: room.wordCategory
   };
