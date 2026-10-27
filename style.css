@@ -59,7 +59,13 @@ button.primary:hover { background: #ff8c6e; }
   display: flex; align-items: center; justify-content: space-between;
   padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line);
 }
+.topbar .room { display: flex; align-items: center; gap: 8px; }
 .topbar .room b { color: var(--accent); letter-spacing: 2px; }
+.topbar .mini {
+  flex: none; padding: 4px 10px; font-size: 13px; border-radius: 8px;
+  background: var(--accent2); color: #1a1d29; font-weight: 700;
+}
+.topbar .mini:hover { background: #5fe0d4; }
 .topbar .round { color: var(--muted); font-size: 14px; }
 .topbar .timer {
   background: var(--panel2); padding: 4px 12px; border-radius: 20px;
@@ -156,3 +162,12 @@ button.primary:hover { background: #ff8c6e; }
   .side { width: 100%; }
   #board { min-height: 300px; }
 }
+
+/* ---- 复制提示浮层 ---- */
+.toast {
+  position: fixed; left: 50%; bottom: 32px; transform: translateX(-50%);
+  background: #11151f; color: #fff; padding: 12px 18px; border-radius: 10px;
+  font-size: 14px; box-shadow: 0 8px 30px rgba(0,0,0,.5); z-index: 999;
+  max-width: 86vw; text-align: center; word-break: break-all;
+}
+.toast.hidden { display: none; }
