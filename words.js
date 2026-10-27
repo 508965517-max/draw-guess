@@ -65,4 +65,5 @@ const WORDS = [
   { w: "梦想", c: "抽象" }
 ];
 
-module.exports = { WORDS };
+if (typeof module !== "undefined" && module.exports) module.exports = { WORDS };
+if (typeof window !== "undefined") window.WORDS = WORDS;
