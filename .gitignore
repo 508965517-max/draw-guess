@@ -1,6 +1,5 @@
 node_modules
 .git
 .workbuddy
-npm-debug.log*
-.env
 *.zip
+.DS_Store
