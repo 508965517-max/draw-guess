@@ -9,6 +9,9 @@ const game = $("game");
 const nameInput = $("nameInput");
 const codeInput = $("codeInput");
 const lobbyMsg = $("lobbyMsg");
+const roomNameInput = $("roomNameInput");
+const inviteBtn = $("inviteBtn");
+const toastEl = $("toast");
 const roomCodeEl = $("roomCode");
 const roundInfo = $("roundInfo");
 const timerEl = $("timer");
@@ -105,6 +108,10 @@ function enter() {
 function genCode() {
   return String(Math.floor(1000 + Math.random() * 9000));
 }
+// 规范化房间名：去首尾/内部空白，最长 20 字符，保留大小写与中文（区分大小写）
+function normalizeRoom(s) {
+  return String(s || "").trim().replace(/\s+/g, "").slice(0, 20);
+}
 function enterGameScreen() {
   lobby.classList.add("hidden");
   game.classList.remove("hidden");
@@ -121,12 +128,65 @@ function backToLobby(msg) {
   isHost = false; roomCode = null; myId = null; room = null;
   try { if (hostConn) { hostConn.close(); hostConn = null; } } catch (e) {}
   try { if (peer) { peer.destroy(); peer = null; } } catch (e) {}
+  inviteBtn.classList.add("hidden");
+  roomNameInput.value = "";
 }
+
+// ---- 邀请链接（短链接分享）----
+function buildInviteUrl(code) {
+  const base = location.origin + location.pathname.split("?")[0];
+  return base + "?room=" + encodeURIComponent(code);
+}
+function showInviteLink(code) {
+  inviteBtn.dataset.url = buildInviteUrl(code);
+  inviteBtn.classList.remove("hidden");
+}
+function copyInvite() {
+  const url = inviteBtn.dataset.url;
+  if (!url) return;
+  const ok = () => showToast("邀请链接已复制，发给朋友即可加入 👇<br>" + url);
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url).then(ok).catch(() => fallbackCopy(url, ok));
+  } else {
+    fallbackCopy(url, ok);
+  }
+}
+function fallbackCopy(text, ok) {
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    document.execCommand("copy"); document.body.removeChild(ta);
+    ok();
+  } catch (e) {
+    showToast("复制失败，请手动复制：" + text);
+  }
+}
+let toastTimer = null;
+function showToast(html) {
+  toastEl.innerHTML = html;
+  toastEl.classList.remove("hidden");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.add("hidden"), 4000);
+}
+inviteBtn.addEventListener("click", copyInvite);
+
+// ---- 从邀请链接进入时，自动填入房间号 ----
+(function initFromUrl() {
+  const params = new URLSearchParams(location.search);
+  const r = params.get("room");
+  if (r) {
+    const code = normalizeRoom(decodeURIComponent(r));
+    codeInput.value = code;
+    lobbyMsg.textContent = "已为你填入房间「" + code + "」，输入昵称后点击「加入房间」即可。";
+  }
+})();
 
 $("createBtn").addEventListener("click", () => {
   const name = enter(); if (!name) return;
+  const custom = normalizeRoom(roomNameInput.value);
   lobbyMsg.textContent = "";
-  createHost(genCode(), name, "multi", botPersonalitySel.value);
+  createHost(custom || genCode(), name, "multi", botPersonalitySel.value);
 });
 $("soloBtn").addEventListener("click", () => {
   const name = enter(); if (!name) return;
@@ -135,10 +195,10 @@ $("soloBtn").addEventListener("click", () => {
 });
 $("joinBtn").addEventListener("click", () => {
   const name = enter(); if (!name) return;
-  const code = codeInput.value.trim();
+  const code = normalizeRoom(codeInput.value);
   if (!code) { lobbyMsg.textContent = "请输入房间号"; return; }
   lobbyMsg.textContent = "";
-  joinAsPlayer(name, code.toUpperCase());
+  joinAsPlayer(name, code);
 });
 
 // ---- 玩家：连接房主 ----
@@ -176,6 +236,7 @@ function createHost(code, name, mode, personality) {
     return;
   }
   // 多人：建立可连接的 Peer，等待朋友加入
+  showInviteLink(code);
   try { peer = new Peer(myId); } catch (e) { lobbyMsg.textContent = "无法创建房间，请重试。"; return; }
   peer.on("open", () => {});
   peer.on("connection", (conn) => {
@@ -617,6 +678,7 @@ function applyState(s) {
   roundsSelect.style.display = (me.isHost && s.phase === "lobby") ? "inline-block" : "none";
   dissolveBtn.classList.toggle("hidden", !me.isHost);
   exitBtn.classList.toggle("hidden", me.isHost);
+  inviteBtn.classList.toggle("hidden", !(me.isHost && !s.solo));
 }
 function applyYourWord({ word }) {
   wordStatus.innerHTML = `你画的词：<span class="mine">${escapeHtml(word)}</span>`;
