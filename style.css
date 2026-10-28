@@ -173,6 +173,35 @@ button.primary:hover { background: #ff8c6e; }
 }
 .toast.hidden { display: none; }
 
+/* ---- 聊天工具按钮 / Emoji 面板 / 聊天图片 ---- */
+.guess-row .chat-tool {
+  padding: 6px 8px; font-size: 16px; line-height: 1;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  cursor: pointer; flex: none;
+}
+.guess-row .chat-tool:hover { border-color: var(--accent); }
+.hidden-file { display: none; }
+.emoji-panel {
+  display: flex; flex-wrap: wrap; gap: 4px; padding: 8px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  margin-bottom: 6px; max-height: 132px; overflow-y: auto;
+}
+.emoji-panel.hidden { display: none; }
+.emoji-panel button {
+  width: 34px; height: 34px; font-size: 20px; line-height: 1;
+  background: transparent; border: none; border-radius: 8px; cursor: pointer;
+}
+.emoji-panel button:hover { background: rgba(255,255,255,.12); }
+#chatLog img.chat-img {
+  max-width: 120px; max-height: 120px; border-radius: 8px; display: block;
+  margin-top: 4px; border: 1px solid var(--line);
+}
+#chatLog .msg img.chat-img { display: inline-block; vertical-align: middle; }
+
+/* ---- 语音按钮状态 ---- */
+#voiceBtn.on { background: var(--accent2); border-color: var(--accent2); color: #fff; }
+#voiceBtn.trying { opacity: .6; }
+
 /* ---- 加入房间确认弹窗 ---- */
 .modal-mask {
   position: fixed; inset: 0; z-index: 1000;
