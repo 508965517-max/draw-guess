@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>你画我猜 · 随时可玩版</title>
-  <link rel="stylesheet" href="style.css?v=1029c" />
+  <link rel="stylesheet" href="style.css?v=1029e" />
 </head>
 <body>
   <!-- 进入房间界面 -->
@@ -47,7 +47,7 @@
   <!-- 游戏主界面 -->
   <div id="game" class="screen hidden">
     <header class="topbar">
-      <div class="room">房间 <b id="roomCode">----</b><button id="inviteBtn" class="mini hidden" title="复制邀请链接">🔗 邀请</button></div>
+      <div class="room">房间 <b id="roomCode">----</b><button id="inviteBtn" class="mini hidden" title="复制邀请链接">🔗 邀请</button><button id="voiceBtn" class="mini hidden" title="和房间里的人语音通话">🎤 语音</button></div>
       <div class="round" id="roundInfo">等待开始</div>
       <div class="timer" id="timer">--</div>
     </header>
@@ -77,10 +77,14 @@
         <ul id="playerList"></ul>
         <div class="chat-box">
           <div id="chatLog"></div>
+          <div id="emojiPanel" class="emoji-panel hidden"></div>
           <div class="guess-row">
+            <button id="emojiBtn" class="chat-tool" title="表情">😊</button>
+            <button id="imgBtn" class="chat-tool" title="发图片/表情包">🖼️</button>
             <input id="guessInput" maxlength="20" placeholder="输入你猜的词…" />
             <button id="sendBtn">发送</button>
           </div>
+          <input type="file" id="imgInput" accept="image/*" class="hidden-file" />
         </div>
         <button id="exitBtn" class="ghost hidden">退出房间</button>
         <div class="host-actions" id="hostActions">
@@ -117,8 +121,8 @@
 
   <script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
   <script>if (!window.mqtt) document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"><\/script>');</script>
-  <script src="words.js?v=1029d"></script>
-  <script src="doodles.js?v=1029d"></script>
-  <script src="client.js?v=1029d"></script>
+  <script src="words.js?v=1029e"></script>
+  <script src="doodles.js?v=1029e"></script>
+  <script src="client.js?v=1029e"></script>
 </body>
 </html>
