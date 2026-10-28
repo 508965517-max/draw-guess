@@ -148,7 +148,15 @@ function hostIdFor(code) {
 function enterGameScreen() {
   lobby.classList.add("hidden");
   game.classList.remove("hidden");
+  fitBoard();
 }
+// 兜底：老内核（如微信 X5）不支持 CSS aspect-ratio，用 JS 强制画布 3:2 显示比例，
+// 保证所有设备几何完全一致（坐标按显示区归一化，比例一致 => 形状一致）。
+function fitBoard() {
+  const w = board.clientWidth;
+  if (w > 0) board.style.height = Math.round(w / 1.5) + "px";
+}
+window.addEventListener("resize", fitBoard);
 function backToLobby(msg) {
   game.classList.add("hidden");
   lobby.classList.remove("hidden");
