@@ -51,17 +51,23 @@ let erasing = false;
 let drawing = false;
 let last = null;
 
-// ---- 网络层 ----
-let peer = null;          // PeerJS Peer 实例
-let hostConn = null;      // 玩家 -> 房主 的连接
-let isHost = false;
-let roomCode = null;
-let myId = null;
-const peers = new Map();  // 房主侧：peerId -> { conn, name }
-const pending = new Map(); // 房主侧：待确认加入的 peerId -> name（收到 joinConfirm 才真正进房）
-let peerWatch = null;      // 房主侧：信令断线守护定时器
-let connSeq = 0;           // 玩家侧：连接序号，忽略过期连接的事件
-let joinRetries = 0;       // 玩家侧：peer-unavailable 自动重试次数
+// ---- 网络层（公共 MQTT 中转，不依赖 WebRTC 打洞，任何网络都能连）----
+// 客户端连公共 MQTT Broker（国内直连），所有游戏消息（笔画/聊天/状态）经它转发。
+// 架构仍是"房主权威"：房主运行游戏逻辑，玩家把操作发给房主，房主广播状态。
+let mqttClient = null;      // mqtt.js 客户端实例
+let myId = null;            // 本机在房间内的唯一 id
+let roomTopicBase = null;   // 本房间的话题前缀，形如 "dg/xxxx/"
+let mqttReconnectFn = null; // 断线后自动重连的闭包
+let presenceSeen = false;   // 玩家侧：是否见到房主在线标记（retained）
+let joinedConfirmed = false;// 玩家侧：是否已确认进房
+const pending = new Map();  // 房主侧：待确认加入的 clientId -> name
+
+// 依次尝试的公共 Broker（EMQ 中国节点优先，国内直连最稳）
+const MQTT_URLS = [
+  "wss://broker-cn.emqx.io:8084/mqtt",
+  "wss://broker.emqx.io:8084/mqtt",
+  "wss://test.mosquitto.org:8081/mqtt"
+];
 
 // ---- 房主侧房间状态 ----
 let room = null;
@@ -97,7 +103,7 @@ eraserBtn.addEventListener("click", () => {
 });
 clearBtn.addEventListener("click", () => {
   if (isHost && me.isDrawer) { clearCanvas(); broadcastToAll({ t: "clear" }); }
-  else if (hostConn) hostConn.send({ t: "clear" });
+  else if (!isHost) sendToHost({ t: "clear" });
 });
 customColor.addEventListener("input", () => {
   penColor = customColor.value; erasing = false; eraserBtn.style.background = "";
@@ -105,7 +111,7 @@ customColor.addEventListener("input", () => {
 });
 newWordBtn.addEventListener("click", () => {
   if (isHost && me.isDrawer) hostNewWord();
-  else if (hostConn) hostConn.send({ t: "newWord" });
+  else if (!isHost) sendToHost({ t: "newWord" });
 });
 
 // ---- 进入房间 ----
@@ -146,10 +152,18 @@ function backToLobby(msg) {
   chatLog.innerHTML = "";
   clearCanvas();
   me = { id: null, isDrawer: false, isHost: false };
+  // 清掉自己的在线标记并断开 MQTT（要在清空 id 之前做）
+  const wasHost = isHost, oldId = myId, oldBase = roomTopicBase;
   isHost = false; roomCode = null; myId = null; room = null;
-  try { if (hostConn) { hostConn.close(); hostConn = null; } } catch (e) {}
-  try { if (peer) { peer.destroy(); peer = null; } } catch (e) {}
-  if (peerWatch) { clearInterval(peerWatch); peerWatch = null; }
+  try {
+    if (mqttClient) {
+      if (oldBase && oldId && !wasHost) clearRetained(oldBase + "p/" + oldId);
+      mqttClient.end(true);
+    }
+  } catch (e) {}
+  mqttClient = null; mqttReconnectFn = null; roomTopicBase = null;
+  presenceSeen = false; joinedConfirmed = false;
+  pending.clear();
   inviteBtn.classList.add("hidden");
   roomNameInput.value = "";
 }
@@ -223,70 +237,153 @@ $("joinBtn").addEventListener("click", () => {
   joinAsPlayer(name, code);
 });
 
-// ---- 玩家：连接房主 ----
-let pendingName = null;
-let joinConfirmed = false;
-function joinAsPlayer(name, code) {
-  roomCode = code; isHost = false; me.isHost = false; pendingName = name; joinConfirmed = false; joinRetries = 0;
-  lobbyMsg.textContent = "正在连接房主，请稍候…";
-  // 两秒弹窗提示：正在加入的房间名，并说明只需房间码或房主链接
-  showToast("正在加入房间「" + code + "」…<br>只需房间码，或打开房主发的邀请链接即可进入。", 2000);
-  peer = new Peer();
-  peer.on("open", (id) => {
-    myId = id; me.id = id;
-    connectToHost(code);
-    // 兜底：长时间没进入游戏（没收到房主状态，且确认框未打开、无重试中）则提示
-    setTimeout(() => {
-      if (!game.classList.contains("hidden")) return;
-      if (!joinModal.classList.contains("hidden")) return;
-      if (joinRetries > 0) return; // 已有错误/重试提示，不覆盖
-      lobbyMsg.textContent = "连接超时：请确认房主页面还开着，或换一个房间号重试。";
-    }, 15000);
-  });
-  // 信令断线自动重连（服务器把房间"弄丢"多半是这个原因）
-  peer.on("disconnected", () => {
-    try { if (peer && !peer.destroyed) peer.reconnect(); } catch (e) {}
-  });
-  peer.on("error", (e) => handleJoinError(e, code));
+// ---- MQTT 网络底层 ----
+// 房间话题：dg/<房间名哈希>/msg    所有游戏消息
+//          dg/<房间名哈希>/presence 房主在线标记（retained，玩家据此判断房间是否存在）
+//          dg/<房间名哈希>/p/<id>   各玩家在线标记（retained + 遗嘱，房主据此感知进出）
+function topicsFor(code) {
+  const base = "dg/" + hostIdFor(code) + "/";
+  return { msg: base + "msg", presence: base + "presence", players: base + "p/" };
 }
-function connectToHost(code) {
-  if (!peer || peer.destroyed) return;
-  const seq = ++connSeq;
-  const hostId = hostIdFor(code);
-  try { hostConn = peer.connect(hostId, { reliable: true }); } catch (e) { return; }
-  hostConn.on("open", () => { if (seq !== connSeq) return; sendHello(); });
-  hostConn.on("data", dispatch);
-  hostConn.on("close", () => {
-    if (seq !== connSeq) return;
-    backToLobby("与房主的连接已断开，请重新加入。");
-  });
-  hostConn.on("error", () => {});
+function connectMqtt(willTopic, onReady, onFail) {
+  let i = 0;
+  const tryNext = () => {
+    if (i >= MQTT_URLS.length) { onFail(); return; }
+    const url = MQTT_URLS[i++];
+    let everUp = false, advanced = false;
+    const opts = {
+      clientId: "dg-" + Math.random().toString(16).slice(2, 10),
+      connectTimeout: 8000, keepalive: 30, reconnectPeriod: 0, clean: true
+    };
+    if (willTopic) opts.will = { topic: willTopic, payload: "", retain: true, qos: 0 };
+    const c = mqtt.connect(url, opts);
+    c.on("connect", () => {
+      everUp = true; mqttClient = c; mqttEverUp = true;
+      onReady(c);
+    });
+    c.on("message", onMqttMessage);
+    const giveUpOrReconnect = () => {
+      if (!everUp) {
+        if (advanced) return; advanced = true;
+        try { c.end(true); } catch (e) {}
+        tryNext();
+      } else {
+        // 连上过之后意外断线：2 秒后自动重连（重订阅 + 重发在线标记）
+        mqttClient = null;
+        if (mqttReconnectFn) setTimeout(mqttReconnectFn, 2000);
+      }
+    };
+    c.on("close", giveUpOrReconnect);
+    c.on("error", () => {});  // close 会跟着来，交给 giveUpOrReconnect
+  };
+  tryNext();
 }
-// 玩家侧连接错误处理：peer-unavailable 自动重试，之后给出清晰排查提示
-function handleJoinError(e, code) {
-  const type = e && e.type ? e.type : String(e || "unknown");
-  if (type === "peer-unavailable") {
-    if (joinRetries < 2) {
-      joinRetries++;
-      lobbyMsg.textContent = "没找到房间，正在重试（" + joinRetries + "/2）…";
-      setTimeout(() => {
-        if (!peer || peer.destroyed) return;
-        if (peer.open) connectToHost(code);
-        else { try { peer.reconnect(); } catch (err) {} }
-      }, 2500);
-      return;
-    }
-    lobbyMsg.innerHTML = "❌ 找不到房间「" + escapeHtml(code) + "」，请依次检查：<br>" +
-      "1️⃣ 房主的页面还开着吗？（房主关了页面，房间就没了）<br>" +
-      "2️⃣ 房间号和房主顶栏显示的<b>完全一致</b>吗？（区分大小写，建议直接点房主发的 🔗 邀请链接进入，别手输）<br>" +
-      "3️⃣ 都没问题的话，让房主刷新页面重建一个房间再试。";
+function mqttSetup(code, willTopic, whenReady, onFail) {
+  const run = () => connectMqtt(willTopic, whenReady, onFail || (() => {
+    if (lobby.classList.contains("hidden")) showToast("与服务器的连接断开，正在重连…", 3000);
+    else lobbyMsg.textContent = "无法连接服务器，请稍后重试。";
+  }));
+  run();
+  mqttReconnectFn = run;
+}
+function subAll(topics, cb) {
+  let left = topics.length;
+  topics.forEach((t) => {
+    mqttClient.subscribe(t, { qos: 0 }, (err) => { if (!err && --left === 0 && cb) cb(); });
+  });
+}
+function mqttPublish(topic, obj, retain) {
+  if (mqttClient && mqttClient.connected) mqttClient.publish(topic, JSON.stringify(obj), { retain: !!retain, qos: 0 });
+}
+function clearRetained(topic) {
+  if (mqttClient) try { mqttClient.publish(topic, "", { retain: true, qos: 0 }); } catch (e) {}
+}
+// 玩家 -> 房主
+function sendToHost(body) {
+  if (roomTopicBase) mqttPublish(roomTopicBase + "msg", { from: myId, role: "player", to: "host", body });
+}
+// 房主 -> 指定玩家
+function publishTo(pid, body) {
+  mqttPublish(roomTopicBase + "msg", { from: myId, role: "host", to: pid, body });
+}
+function notFoundMsg(code) {
+  return "❌ 找不到房间「" + escapeHtml(code) + "」，请依次检查：<br>" +
+    "1️⃣ 房主的页面还开着吗？（房主关了页面，房间就没了）<br>" +
+    "2️⃣ 房间号和房主顶栏显示的<b>完全一致</b>吗？（区分大小写，建议直接点房主发的 🔗 邀请链接进入，别手输）<br>" +
+    "3️⃣ 都没问题的话，让房主刷新页面重建一个房间再试。";
+}
+// 所有 MQTT 消息的统一入口
+function onMqttMessage(topic, payloadStr) {
+  if (!roomTopicBase) return;
+  const tp = topicsFor(roomCode);
+  if (topic === tp.presence) { handlePresence(payloadStr); return; }
+  if (topic.startsWith(tp.players)) {
+    if (isHost) handlePlayerPresence(topic.slice(tp.players.length), payloadStr);
     return;
   }
-  lobbyMsg.textContent = "连接错误：" + type + "。请检查网络后重试。";
+  if (topic !== tp.msg) return;
+  let m; try { m = JSON.parse(payloadStr); } catch (e) { return; }
+  if (!m || m.from === myId) return;
+  if (m.except && m.except === myId) return;
+  if (m.to && m.to !== "*" && m.to !== myId) return;
+  if (isHost) { if (m.role === "player") onHostMessage(m.body, m.from); }
+  else { if (m.role === "host") dispatch(m.body); }
 }
-// 向房主报到（房主收到 welcome 后会再次触发，确保首包不丢）
+// 玩家侧：房主在线标记（retained；房主掉线时 MQTT 遗嘱会发空标记）
+function handlePresence(payloadStr) {
+  if (isHost) return;
+  let pl = null; try { pl = JSON.parse(payloadStr); } catch (e) {}
+  const online = !!(pl && pl.online);
+  if (joinedConfirmed) {
+    if (!online) backToLobby("房主已离开或掉线，房间已关闭。");
+    return;
+  }
+  if (!online) {
+    if (!presenceSeen) lobbyMsg.innerHTML = notFoundMsg(roomCode);
+    return;
+  }
+  if (!presenceSeen) {
+    presenceSeen = true;
+    lobbyMsg.textContent = "已找到房间，正在加入…";
+    sendHello();
+  }
+}
+// 房主侧：玩家在线标记（含 MQTT 遗嘱：掉线时会自动收到空标记）
+function handlePlayerPresence(pid, payloadStr) {
+  if (!room || pid === myId) return;
+  let pl = null; try { pl = JSON.parse(payloadStr); } catch (e) {}
+  if (!pl || !pl.online) { handleDisconnect(pid, false); return; }
+  // 玩家上线/重连：若已在房间，补发一份状态
+  if (room.players.some((p) => p.id === pid)) publishTo(pid, { t: "state", ...buildView(pid) });
+}
+
+// ---- 玩家：加入房间 ----
+let pendingName = null;
+function joinAsPlayer(name, code) {
+  roomCode = code; isHost = false; me.isHost = false; pendingName = name;
+  joinedConfirmed = false; presenceSeen = false; helloCount = 0;
+  myId = "p-" + Math.random().toString(16).slice(2, 10);
+  roomTopicBase = "dg/" + hostIdFor(code) + "/";
+  lobbyMsg.textContent = "正在连接服务器…";
+  showToast("正在加入房间「" + code + "」…<br>只需房间码，或打开房主发的邀请链接即可进入。", 2000);
+  const tp = topicsFor(code);
+  mqttSetup(code, tp.players + myId, (c) => {
+    subAll([tp.msg, tp.presence], () => {
+      // retained 的房主在线标记会立刻送达 handlePresence；超时仍未见则视为找不到房间
+      setTimeout(() => {
+        if (joinedConfirmed || presenceSeen) return;
+        if (!lobby.classList.contains("hidden")) lobbyMsg.innerHTML = notFoundMsg(code);
+      }, 8000);
+    });
+  }, () => {
+    lobbyMsg.textContent = "无法连接服务器（所有线路均失败），请稍后重试。";
+  });
+}
+// 向房主报到（QoS0 可能丢，未确认前每 2.5 秒重发，最多 5 次）
+let helloCount = 0;
 function sendHello() {
-  if (hostConn && hostConn.open) hostConn.send({ t: "hello", name: pendingName });
+  sendToHost({ t: "hello", name: pendingName });
+  if (++helloCount <= 5) setTimeout(() => { if (!joinedConfirmed && roomTopicBase) sendHello(); }, 2500);
 }
 // 房主回传房间信息 -> 弹出加入确认框（含房间名 + 成员名单）
 function showJoinConfirm(roomName, members) {
@@ -301,21 +398,22 @@ function showJoinConfirm(roomName, members) {
 }
 joinAcceptBtn.addEventListener("click", () => {
   joinModal.classList.add("hidden");
-  joinConfirmed = true;
-  if (hostConn && hostConn.open) hostConn.send({ t: "joinConfirm" });
+  joinedConfirmed = true;
+  // 发布自己的在线标记（retained），房主据此确认
+  mqttPublish(roomTopicBase + "p/" + myId, { online: true, name: pendingName }, true);
+  sendToHost({ t: "joinConfirm" });
 });
 joinRejectBtn.addEventListener("click", () => {
   joinModal.classList.add("hidden");
+  clearRetained(roomTopicBase + "p/" + myId);
   backToLobby("你已取消加入该房间。");
-  try { if (hostConn) hostConn.close(); } catch (e) {}
-  try { if (peer) peer.destroy(); } catch (e) {}
 });
 
 // ---- 房主：创建房间 ----
 function createHost(code, name, mode, personality) {
   isHost = true; me.isHost = true;
-  const pid = hostIdFor(code);   // 底层 ID 用哈希，中文房间名也能注册
-  me.id = pid; myId = pid; roomCode = code;
+  myId = "h-" + Math.random().toString(16).slice(2, 10);
+  me.id = myId; roomCode = code;
   room = makeRoom(code);
   room.solo = mode === "solo";
   if (personality === "instant" || personality === "chatty") room.botPersonality = personality;
@@ -329,57 +427,40 @@ function createHost(code, name, mode, personality) {
     startGame(5);
     return;
   }
-  // 多人：建立可连接的 Peer，等待朋友加入
+  // 多人：连 MQTT，登记房间在线标记，等待朋友加入
   showInviteLink(code);
-  try { peer = new Peer(pid); } catch (e) { lobbyMsg.textContent = "无法创建房间，请重试。"; return; }
-  peer.on("open", () => { showToast("✅ 房间已就绪，朋友可通过邀请链接或房间号加入了。", 3500); });
-  // 信令断线自动重连：否则房间会从服务器"消失"，朋友就会报 peer-unavailable
-  peer.on("disconnected", () => {
-    try { if (peer && !peer.destroyed) peer.reconnect(); } catch (e) {}
-  });
-  clearInterval(peerWatch);
-  peerWatch = setInterval(() => {
-    if (peer && peer.disconnected && !peer.destroyed) { try { peer.reconnect(); } catch (e) {} }
-  }, 10000);
-  peer.on("connection", (conn) => {
-    peers.set(conn.peer, { conn, name: null });   // 关键：登记连接，broadcast 才能发得出去
-    const sendWelcome = () => { if (conn.open) conn.send({ t: "welcome" }); };
-    if (conn.open) sendWelcome();
-    conn.on("open", sendWelcome);
-    conn.on("data", (d) => onHostMessage(d, conn));
-    conn.on("close", () => handleDisconnect(conn.peer, false));
-    conn.on("error", () => {});
-  });
-  peer.on("error", (e) => {
-    if (e && e.type === "unavailable-id") {
-      lobbyMsg.textContent = "房间号被占用，请返回重新创建一个房间。";
-      backToLobby("房间号被占用，请重新创建。");
-    } else {
-      lobbyMsg.textContent = "房间创建失败：" + (e && e.type ? e.type : e);
-    }
+  roomTopicBase = "dg/" + hostIdFor(code) + "/";
+  const tp = topicsFor(code);
+  lobbyMsg.textContent = "";
+  const readyUp = (c) => {
+    subAll([tp.msg, tp.players + "+"], () => {
+      mqttPublish(tp.presence, { online: true, room: code }, true);
+      showToast("✅ 房间已就绪，朋友可通过邀请链接或房间号加入了。", 3500);
+    });
+  };
+  mqttSetup(code, tp.presence, readyUp, () => {
+    lobbyMsg.textContent = "无法连接服务器（所有线路均失败），请稍后重试。";
   });
 }
 
 // ---- 房主：收到玩家的消息 ----
-function onHostMessage(d, conn) {
+function onHostMessage(d, pid) {
   if (!room) return;
-  const pid = conn.peer;
   switch (d.t) {
     case "hello": {
       const name = String(d.name || "玩家").slice(0, 12) || "玩家";
-      if (peers.has(pid)) peers.get(pid).name = name;
       if (room.players.some((p) => p.id === pid)) {
-        if (conn.open) conn.send({ t: "state", ...buildView(pid) });
+        publishTo(pid, { t: "state", ...buildView(pid) });
         return;
       }
       // 先不进房：把房间名 + 现有成员发回，等玩家点「加入」确认（确保进对房间）
       pending.set(pid, name);
-      if (conn.open) conn.send({ t: "roomInfo", roomName: room.code, members: room.players.map((p) => p.name) });
+      publishTo(pid, { t: "roomInfo", roomName: room.code, members: room.players.map((p) => p.name) });
       break;
     }
     case "joinConfirm": {
       if (!pending.has(pid)) {
-        if (room.players.some((p) => p.id === pid) && conn.open) conn.send({ t: "state", ...buildView(pid) });
+        if (room.players.some((p) => p.id === pid)) publishTo(pid, { t: "state", ...buildView(pid) });
         break;
       }
       const name = pending.get(pid);
@@ -392,7 +473,6 @@ function onHostMessage(d, conn) {
     }
     case "joinReject": {
       pending.delete(pid);
-      try { if (conn.open) conn.close(); } catch (e) {}
       break;
     }
     case "start": if (pid === room.hostId) startGame(parseInt(d.rounds, 10)); break;
@@ -473,10 +553,10 @@ function chatHost(name, text, type) {
 function systemChatHost(text) { chatHost("系统", text, "system"); }
 
 function broadcastToAll(obj) {
-  for (const { conn } of peers.values()) if (conn.open) conn.send(obj);
+  mqttPublish(roomTopicBase + "msg", { from: myId, role: "host", to: "*", body: obj });
 }
 function broadcastToAllExcept(obj, exceptId) {
-  for (const [pid, { conn }] of peers) if (pid !== exceptId && conn.open) conn.send(obj);
+  mqttPublish(roomTopicBase + "msg", { from: myId, role: "host", to: "*", except: exceptId, body: obj });
 }
 // 房主产生事件：本机应用 + 广播给玩家
 function hostSend(obj) { broadcastToAll(obj); dispatch(obj); }
@@ -500,7 +580,7 @@ function buildView(forId) {
 }
 function broadcastStateHost() {
   applyState(buildView(myId));
-  for (const [pid, { conn }] of peers) if (conn.open) conn.send({ t: "state", ...buildView(pid) });
+  for (const p of room.players) if (p.id !== myId) publishTo(p.id, { t: "state", ...buildView(p.id) });
 }
 
 function startGame(rounds) {
@@ -541,7 +621,7 @@ function startRound() {
 
   // 把词单独发给画手
   if (drawer.id === myId) applyYourWord({ word: room.word });
-  else { const c = peers.get(drawer.id); if (c && c.conn.open) c.conn.send({ t: "yourWord", word: room.word }); }
+  else { publishTo(drawer.id, { t: "yourWord", word: room.word }); }
 
   broadcastStateHost();
 
@@ -616,7 +696,7 @@ function hostNewWord() {
   clearCanvas(); broadcastToAll({ t: "clear" });
   const dr = room.players.find((p) => p.id === room.drawerId);
   if (dr && dr.id === myId) applyYourWord({ word: room.word });
-  else { const c = peers.get(dr.id); if (c && c.conn.open) c.conn.send({ t: "yourWord", word: room.word }); }
+  else { publishTo(dr.id, { t: "yourWord", word: room.word }); }
   broadcastStateHost();
   systemChatHost("画手更换了词语。");
 }
@@ -633,8 +713,7 @@ function hostDissolve() {
   clearInterval(room.timer); clearBotTimers();
   broadcastToAll({ t: "roomDissolved" });
   room = null;
-  try { if (peer) peer.destroy(); } catch (e) {}
-  if (peerWatch) { clearInterval(peerWatch); peerWatch = null; }
+  clearRetained(roomTopicBase + "presence");   // 撤下房间在线标记
   backToLobby("房间已解散。");
 }
 
@@ -650,7 +729,7 @@ function handleDisconnect(pid, voluntary) {
     clearInterval(room.timer); clearBotTimers();
     const wasSolo = room.solo;
     room = null;
-    try { if (peer) peer.destroy(); } catch (e) {}
+    clearRetained(roomTopicBase + "presence"); // 撤下房间在线标记
     backToLobby(wasSolo ? "机器人已离开，游戏结束。" : "所有玩家已离开。");
     return;
   }
@@ -752,7 +831,6 @@ function botEmitDraw(seg) {
 // ---- 玩家 / 房主通用：接收消息 ----
 function dispatch(m) {
   switch (m.t) {
-    case "welcome": sendHello(); break;   // 房主已就绪，补发报到，确保首包不丢
     case "roomInfo": showJoinConfirm(m.roomName, m.members); break;  // 弹出加入确认框
     case "state": applyState(m); break;
     case "yourWord": applyYourWord(m); break;
@@ -770,6 +848,7 @@ function dispatch(m) {
 
 function applyState(s) {
   joinModal.classList.add("hidden");
+  joinedConfirmed = true;
   me.isDrawer = s.youAreDrawer;
   me.isHost = s.hostId === me.id;
   if (!lobby.classList.contains("hidden")) { lobby.classList.add("hidden"); game.classList.remove("hidden"); }
@@ -843,8 +922,8 @@ function sendGuess() {
   if (isHost) {
     const p = room.players.find((x) => x.id === myId);
     if (p) { chatHost(p.name, text, "msg"); checkGuess(p, text); }
-  } else if (hostConn) {
-    hostConn.send({ t: "guess", text });
+  } else {
+    sendToHost({ t: "guess", text });
   }
   guessInput.value = "";
 }
@@ -891,7 +970,7 @@ board.addEventListener("pointermove", (e) => {
   const seg = { from: last, to: p, color, size };
   stroke(last, p, color, size);
   if (isHost) emitDraw(seg);
-  else if (hostConn) hostConn.send({ t: "draw", seg });
+  else sendToHost({ t: "draw", seg });
   last = p;
 });
 board.addEventListener("pointerup", () => { drawing = false; });
@@ -900,21 +979,21 @@ board.addEventListener("pointerleave", () => { drawing = false; });
 // ---- 房主控制 ----
 startBtn.addEventListener("click", () => {
   if (isHost) startGame(parseInt(roundsSelect.value, 10));
-  else if (hostConn) hostConn.send({ t: "start", rounds: parseInt(roundsSelect.value, 10) });
+  else sendToHost({ t: "start", rounds: parseInt(roundsSelect.value, 10) });
 });
 restartBtn.addEventListener("click", () => {
   if (isHost) hostRestart();
-  else if (hostConn) hostConn.send({ t: "restart" });
+  else sendToHost({ t: "restart" });
 });
 dissolveBtn.addEventListener("click", () => {
   if (confirm("确定解散房间？所有玩家都会被送回主页。")) {
     if (isHost) hostDissolve();
-    else if (hostConn) hostConn.send({ t: "dissolve" });
+    else sendToHost({ t: "dissolve" });
   }
 });
 exitBtn.addEventListener("click", () => {
   if (confirm("确定退出房间？")) {
-    if (hostConn) hostConn.send({ t: "leave" });
+    if (!isHost) sendToHost({ t: "leave" });
     backToLobby("你已退出房间。");
   }
 });
