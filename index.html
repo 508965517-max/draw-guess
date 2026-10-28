@@ -115,7 +115,8 @@
 
   <div id="toast" class="toast hidden"></div>
 
-  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="https://unpkg.com/mqtt@5.10.1/dist/mqtt.min.js"></script>
+  <script>if (!window.mqtt) document.write('<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"><\/script>');</script>
   <script src="words.js"></script>
   <script src="doodles.js"></script>
   <script src="client.js"></script>
