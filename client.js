@@ -482,6 +482,12 @@ function onHostMessage(d, pid) {
       break;
     }
     case "start": if (pid === room.hostId) startGame(parseInt(d.rounds, 10)); break;
+    case "drawBatch":
+      if (pid === room.drawerId) {
+        for (const seg of d.segs) { room.strokes.push(seg); stroke(seg.from, seg.to, seg.color, seg.size); }
+        broadcastToAllExcept({ t: "drawBatch", segs: d.segs }, pid);
+      }
+      break;
     case "draw":
       if (pid === room.drawerId) {
         const seg = d.seg;
@@ -818,10 +824,21 @@ function scheduleBot() {
 }
 
 // ---- 房主：绘制下发 ----
+// 笔画打包：本地照常每段都画，但网络发送每 100ms 攒一批，
+// 把每秒几十条小消息压到 ~10 条，公共服务器就不会丢包了。
+let strokeQueue = [];
+setInterval(() => {
+  if (!strokeQueue.length) return;
+  const segs = strokeQueue.splice(0, 24);
+  const msg = { t: "drawBatch", segs };
+  if (isHost) broadcastToAll(msg);
+  else sendToHost(msg);
+}, 100);
+
 function emitDraw(seg) {
   room.strokes.push(seg);
   stroke(seg.from, seg.to, seg.color, seg.size);
-  broadcastToAll({ t: "draw", seg });
+  strokeQueue.push(seg);
   // 单人模式：人画 -> 安排机器人陪猜
   if (room.solo && !room.botScheduled && room.drawerId !== "bot-" + room.code) {
     room.botScheduled = true;
@@ -831,7 +848,7 @@ function emitDraw(seg) {
 function botEmitDraw(seg) {
   room.strokes.push(seg);
   stroke(seg.from, seg.to, seg.color, seg.size);
-  broadcastToAll({ t: "draw", seg });
+  strokeQueue.push(seg);
 }
 
 // ---- 玩家 / 房主通用：接收消息 ----
@@ -840,8 +857,9 @@ function dispatch(m) {
     case "roomInfo": showJoinConfirm(m.roomName, m.members); break;  // 弹出加入确认框
     case "state": applyState(m); break;
     case "yourWord": applyYourWord(m); break;
+    case "drawBatch": (m.segs || []).forEach((s) => stroke(s.from, s.to, s.color, s.size)); break;
     case "draw": stroke(m.seg.from, m.seg.to, m.seg.color, m.seg.size); break;
-    case "clear": clearCanvas(); break;
+    case "clear": clearCanvas(); strokeQueue = []; break;
     case "chat": addChat(m); break;
     case "roundStart": applyRoundStart(m); break;
     case "roundEnd": applyRoundEnd(m); break;
@@ -901,6 +919,7 @@ function applyYourWord({ word }) {
 }
 function applyRoundStart({ drawerName, round, totalRounds, category, wordLen }) {
   clearCanvas();
+  strokeQueue = [];   // 新回合：丢弃尚未发出的旧笔画
   if (!me.isDrawer) {
     wordStatus.textContent = `提示：${category} · 共 ${wordLen} 个字`;
     roundInfo.textContent = `第 ${round}/${totalRounds} 轮 · ${drawerName} 在画`;
@@ -974,9 +993,9 @@ board.addEventListener("pointermove", (e) => {
   const color = erasing ? "#ffffff" : penColor;
   const size = erasing ? penSize * 2.2 : penSize;
   const seg = { from: last, to: p, color, size };
-  stroke(last, p, color, size);
+  stroke(last, p, color, size);   // 本地立刻画，不等待网络
   if (isHost) emitDraw(seg);
-  else sendToHost({ t: "draw", seg });
+  else strokeQueue.push(seg);     // 攒批发送，防止高频小包被服务器丢弃
   last = p;
 });
 board.addEventListener("pointerup", () => { drawing = false; });
