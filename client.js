@@ -324,8 +324,10 @@ function onMqttMessage(topic, payloadStr) {
   if (topic !== tp.msg) return;
   let m; try { m = JSON.parse(payloadStr); } catch (e) { return; }
   if (!m || m.from === myId) return;
+  // "host" 是房主的别名：只有房主本人能认领收件人为 host 的消息
+  if (m.to === "host" && !isHost) return;
+  if (m.to && m.to !== "*" && m.to !== "host" && m.to !== myId) return;
   if (m.except && m.except === myId) return;
-  if (m.to && m.to !== "*" && m.to !== myId) return;
   if (isHost) { if (m.role === "player") onHostMessage(m.body, m.from); }
   else { if (m.role === "host") dispatch(m.body); }
 }
