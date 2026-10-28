@@ -42,9 +42,15 @@ const joinRoomNameEl = $("joinRoomName");
 const joinMembersEl = $("joinMembers");
 const joinAcceptBtn = $("joinAcceptBtn");
 const joinRejectBtn = $("joinRejectBtn");
+const voiceBtn = $("voiceBtn");
+const emojiBtn = $("emojiBtn");
+const imgBtn = $("imgBtn");
+const imgInput = $("imgInput");
+const emojiPanelEl = $("emojiPanel");
 
 // ---- 通用状态 ----
 let me = { id: null, isDrawer: false, isHost: false };
+let curDrawerId = null;   // 当前画手 id（用于校验一跳直发的笔画广播）
 let penColor = "#111111";
 let penSize = 10;
 let erasing = false;
@@ -165,6 +171,10 @@ function backToLobby(msg) {
   presenceSeen = false; joinedConfirmed = false;
   pending.clear();
   inviteBtn.classList.add("hidden");
+  voiceBtn.classList.add("hidden");
+  voiceBtn.classList.remove("on", "trying");
+  try { teardownVoice(); } catch (e) {}
+  curDrawerId = null;
   roomNameInput.value = "";
 }
 
@@ -243,7 +253,7 @@ $("joinBtn").addEventListener("click", () => {
 //          dg/<房间名哈希>/p/<id>   各玩家在线标记（retained + 遗嘱，房主据此感知进出）
 function topicsFor(code) {
   const base = "dg/" + hostIdFor(code) + "/";
-  return { msg: base + "msg", presence: base + "presence", players: base + "p/" };
+  return { msg: base + "msg", presence: base + "presence", players: base + "p/", voice: base + "voice/" };
 }
 function connectMqtt(willTopic, onReady, onFail) {
   let i = 0;
@@ -321,13 +331,25 @@ function onMqttMessage(topic, payloadStr) {
     if (isHost) handlePlayerPresence(topic.slice(tp.players.length), payloadStr);
     return;
   }
+  if (topic.startsWith(tp.voice)) { handleVoiceMsg(topic.slice(tp.voice.length), payloadStr); return; }
   if (topic !== tp.msg) return;
   let m; try { m = JSON.parse(payloadStr); } catch (e) { return; }
   if (!m || m.from === myId) return;
-  // "host" 是房主的别名：只有房主本人能认领收件人为 host 的消息
   if (m.to === "host" && !isHost) return;
   if (m.to && m.to !== "*" && m.to !== "host" && m.to !== myId) return;
   if (m.except && m.except === myId) return;
+  // 画手直发的笔画广播：一跳到达，房主记录、所有人渲染
+  if (m.role === "drawer") {
+    if (!m.body || m.body.t !== "drawBatch") return;
+    if (isHost) {
+      if (room && m.from === room.drawerId && m.from !== myId) {
+        for (const s of m.body.segs) { room.strokes.push(s); stroke(s.from, s.to, s.color, s.size); }
+      }
+    } else if (m.from === curDrawerId) {
+      (m.body.segs || []).forEach((s) => stroke(s.from, s.to, s.color, s.size));
+    }
+    return;
+  }
   if (isHost) { if (m.role === "player") onHostMessage(m.body, m.from); }
   else { if (m.role === "host") dispatch(m.body); }
 }
@@ -370,7 +392,7 @@ function joinAsPlayer(name, code) {
   showToast("正在加入房间「" + code + "」…<br>只需房间码，或打开房主发的邀请链接即可进入。", 2000);
   const tp = topicsFor(code);
   mqttSetup(code, tp.players + myId, (c) => {
-    subAll([tp.msg, tp.presence], () => {
+    subAll([tp.msg, tp.presence, tp.voice + "#"], () => {
       // retained 的房主在线标记会立刻送达 handlePresence；超时仍未见则视为找不到房间
       setTimeout(() => {
         if (joinedConfirmed || presenceSeen) return;
@@ -439,7 +461,7 @@ function createHost(code, name, mode, personality) {
   const tp = topicsFor(code);
   lobbyMsg.textContent = "";
   const readyUp = (c) => {
-    subAll([tp.msg, tp.players + "+"], () => {
+    subAll([tp.msg, tp.players + "+", tp.voice + "#"], () => {
       mqttPublish(tp.presence, { online: true, room: code }, true);
       showToast("✅ 房间已就绪，朋友可通过邀请链接或房间号加入了。", 3500);
     });
@@ -501,6 +523,11 @@ function onHostMessage(d, pid) {
     case "guess": {
       const p = room.players.find((x) => x.id === pid);
       if (p) { chatHost(p.name, d.text, "msg"); checkGuess(p, d.text); }
+      break;
+    }
+    case "image": {
+      const p = room.players.find((x) => x.id === pid);
+      if (p && typeof d.data === "string" && d.data.length <= 62 * 1024) chatHost(p.name, d.data, "img");
       break;
     }
     case "restart": if (pid === room.hostId) hostRestart(); break;
@@ -824,16 +851,28 @@ function scheduleBot() {
 }
 
 // ---- 房主：绘制下发 ----
-// 笔画打包：本地照常每段都画，但网络发送每 100ms 攒一批，
-// 把每秒几十条小消息压到 ~10 条，公共服务器就不会丢包了。
+// 笔画打包 + 一跳直发：
+//  - 本地照常每段都画，不等网络；
+//  - 每 50ms 把队列攒成一条 drawBatch：画手直接向全房间广播（role:"drawer"），
+//    其他人和房主各自接收，少一跳、延迟近乎减半；房主顺便记录 strokes；
+//  - 坐标保留 3 位小数，消息更小。
 let strokeQueue = [];
+const r3 = (n) => Math.round(n * 1000) / 1000;
 setInterval(() => {
-  if (!strokeQueue.length) return;
-  const segs = strokeQueue.splice(0, 24);
+  if (!strokeQueue.length || !roomTopicBase) return;
+  const segs = strokeQueue.splice(0, 24).map((s) => ({
+    from: { x: r3(s.from.x), y: r3(s.from.y) },
+    to: { x: r3(s.to.x), y: r3(s.to.y) },
+    color: s.color, size: s.size
+  }));
   const msg = { t: "drawBatch", segs };
-  if (isHost) broadcastToAll(msg);
-  else sendToHost(msg);
-}, 100);
+  if (me.isDrawer) {
+    // 画手（无论是否房主）直接广播给全房间
+    mqttPublish(roomTopicBase + "msg", { from: myId, role: "drawer", to: "*", body: msg });
+  } else if (isHost) {
+    broadcastToAll(msg);   // 机器人画画：房主代发
+  }
+}, 50);
 
 function emitDraw(seg) {
   room.strokes.push(seg);
@@ -874,6 +913,7 @@ function applyState(s) {
   joinModal.classList.add("hidden");
   joinedConfirmed = true;
   me.isDrawer = s.youAreDrawer;
+  curDrawerId = s.drawerId;
   me.isHost = s.hostId === me.id;
   if (!lobby.classList.contains("hidden")) { lobby.classList.add("hidden"); game.classList.remove("hidden"); }
   roomCodeEl.textContent = s.code;
@@ -913,6 +953,7 @@ function applyState(s) {
   dissolveBtn.classList.toggle("hidden", !me.isHost);
   exitBtn.classList.toggle("hidden", me.isHost);
   inviteBtn.classList.toggle("hidden", !(me.isHost && !s.solo));
+  voiceBtn.classList.toggle("hidden", !!s.solo);
 }
 function applyYourWord({ word }) {
   wordStatus.innerHTML = `你画的词：<span class="mine">${escapeHtml(word)}</span>`;
@@ -957,9 +998,64 @@ guessInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendGuess
 function addChat(m) {
   const div = document.createElement("div");
   if (m.type === "msg") div.innerHTML = `<span class="name">${escapeHtml(m.name)}：</span>${escapeHtml(m.text)}`;
+  else if (m.type === "img") div.innerHTML = `<span class="name">${escapeHtml(m.name)}：</span><img class="chat-img" src="${m.text}" alt="图片">`;
   else { div.className = m.type; div.textContent = `${m.name}：${m.text}`; }
   chatLog.appendChild(div);
   chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+// ---- Emoji 面板 & 图片消息（当表情包用）----
+const EMOJIS = ["😂","🤣","😭","😱","🥰","😅","🙃","😎","🤔","🤡","😤","🥺","😴","🤯","👻","💀","🙈","🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐨","🐯","🦁","🐮","🐷","🐸","🐵","🐔","🐧","🦆","🦅","🦉","🐴","🦄","🐝","🐛","🦋","🐌","🐞","🐢","🐍","🐙","🦀","🐬","🐳","🌈","⭐","🔥","👍","👎","👏","🙏","💪","🤝","✌️","🤙","👀","🧠","💯","🎉","🎊","❤️","💔","✨","⚡","💩","🤖"];
+EMOJIS.forEach((e) => {
+  const b = document.createElement("button");
+  b.textContent = e;
+  b.addEventListener("click", () => {
+    guessInput.value += e;
+    guessInput.focus();
+  });
+  emojiPanelEl.appendChild(b);
+});
+emojiBtn.addEventListener("click", () => {
+  emojiPanelEl.classList.toggle("hidden");
+});
+imgBtn.addEventListener("click", () => imgInput.click());
+imgInput.addEventListener("change", () => {
+  const f = imgInput.files && imgInput.files[0];
+  imgInput.value = "";
+  if (!f) return;
+  compressImage(f, (dataUrl) => {
+    if (!dataUrl) { showToast("图片太大或格式不支持，换一张试试～"); return; }
+    // 走聊天广播（type:"img"），不参与猜词判定
+    if (isHost) {
+      const p = room && room.players.find((x) => x.id === myId);
+      chatHost(p ? p.name : "我", dataUrl, "img");
+    } else {
+      sendToHost({ t: "image", data: dataUrl });
+    }
+  });
+});
+// 压缩图片：最长边 200px 起，超出 40KB 逐级降质，压不下去就放弃
+function compressImage(file, cb) {
+  const img = new Image();
+  const url = URL.createObjectURL(file);
+  img.onload = () => {
+    URL.revokeObjectURL(url);
+    const tryQ = [[200, 0.6], [160, 0.5], [120, 0.4]];
+    let result = null;
+    for (const [maxSide, q] of tryQ) {
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.max(1, Math.round(img.width * scale));
+      c.height = Math.max(1, Math.round(img.height * scale));
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      const out = c.toDataURL("image/jpeg", q);
+      if (out.length <= 42 * 1024) { result = out; break; }
+      result = out; // 先记着，继续试更小的
+    }
+    cb(result && result.length <= 60 * 1024 ? result : null);
+  };
+  img.onerror = () => { URL.revokeObjectURL(url); cb(null); };
+  img.src = url;
 }
 
 // ---- 画布 ----
@@ -1026,4 +1122,131 @@ exitBtn.addEventListener("click", () => {
 // ---- 工具 ----
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ---- 语音通话（WebRTC 音频直连 + MQTT 信令）----
+// 说明：握手走房间的 MQTT 通道（稳），音频本身是两端直连（不经服务器、延迟低）。
+// 直连受双方网络限制，个别运营商网络可能连不上；连不上会有提示，此时建议用微信语音。
+const VOICE_ICE = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun.cloudflare.com:3478" },
+  { urls: "stun:stun1.l.google.com:19302" }
+];
+let voiceOn = false;
+let localStream = null;
+const voicePeers = new Map(); // peerId -> { pc, audio }
+
+function voiceSignal(to, kind, data) {
+  mqttPublish(roomTopicBase + "voice/" + to, { from: myId, kind, data: data || null });
+}
+function setVoiceUI(state) {
+  voiceBtn.classList.toggle("on", state === "on");
+  voiceBtn.classList.toggle("trying", state === "trying");
+  voiceBtn.textContent = state === "on" ? "🎤 语音中" : (state === "trying" ? "🎤 连接中…" : "🎤 语音");
+}
+voiceBtn.addEventListener("click", async () => {
+  if (voiceOn) { teardownVoice(); showToast("已关闭语音。"); return; }
+  if (!roomTopicBase || !mqttClient) { showToast("语音只在多人房间可用。"); return; }
+  setVoiceUI("trying");
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) {
+    setVoiceUI("off");
+    showToast("无法访问麦克风（权限被拒或浏览器不支持），开不了语音。");
+    return;
+  }
+  localStream = stream;
+  voiceOn = true;
+  // 广播"我开语音了"，已在语音中的人会来和我握手
+  mqttPublish(roomTopicBase + "voice/announce", { from: myId, kind: "hello" });
+  showToast("🎤 正在建立语音…音频是直连，若十几秒后还没声音，可能是网络不支持，建议改用微信语音。", 5000);
+});
+function teardownVoice() {
+  if (!voiceOn && !voicePeers.size && !localStream) { setVoiceUI("off"); return; }
+  for (const pid of voicePeers.keys()) { try { voiceSignal(pid, "leave"); } catch (e) {} }
+  voiceOn = false;
+  if (localStream) { localStream.getTracks().forEach((t) => t.stop()); localStream = null; }
+  for (const v of voicePeers.values()) {
+    try { v.pc.close(); } catch (e) {}
+    if (v.audio) v.audio.remove();
+  }
+  voicePeers.clear();
+  setVoiceUI("off");
+}
+async function ensureVoicePeer(remoteId) {
+  if (voicePeers.has(remoteId)) return voicePeers.get(remoteId).pc;
+  const pc = new RTCPeerConnection({ iceServers: VOICE_ICE });
+  const audio = document.createElement("audio");
+  audio.autoplay = true; audio.style.display = "none";
+  document.body.appendChild(audio);
+  voicePeers.set(remoteId, { pc, audio });
+  if (localStream) localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+  pc.ontrack = (ev) => { audio.srcObject = ev.streams[0]; setVoiceUI("on"); };
+  pc.onicecandidate = (ev) => { if (ev.candidate) voiceSignal(remoteId, "ice", ev.candidate.toJSON()); };
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === "connected") setVoiceUI("on");
+    else if (pc.connectionState === "failed") {
+      showToast("有一路语音连不上（网络受限）。若一直连不上，建议用微信语音。");
+    }
+  };
+  return pc;
+}
+async function startVoiceOffer(remoteId) {
+  try {
+    const pc = await ensureVoicePeer(remoteId);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    voiceSignal(remoteId, "offer", { type: offer.type, sdp: offer.sdp });
+  } catch (e) {}
+}
+function handleVoiceMsg(suffix, payloadStr) {
+  // 只处理广播(announce)和发给自己(voice/<myId>)的信令
+  if (suffix !== myId && suffix !== "announce") return;
+  let m; try { m = JSON.parse(payloadStr); } catch (e) { return; }
+  if (!m || m.from === myId) return;
+  const from = m.from;
+  switch (m.kind) {
+    case "hello":   // 有人开语音：我在语音中就回应，id 较小的一方发 offer
+      if (!voiceOn) return;
+      voiceSignal(from, "iam");
+      if (myId < from) startVoiceOffer(from);
+      break;
+    case "iam":
+      if (!voiceOn) return;
+      if (myId < from) startVoiceOffer(from);
+      break;
+    case "offer":
+      if (!voiceOn) return;
+      (async () => {
+        try {
+          const pc = await ensureVoicePeer(from);
+          await pc.setRemoteDescription(new RTCSessionDescription(m.data));
+          const ans = await pc.createAnswer();
+          await pc.setLocalDescription(ans);
+          voiceSignal(from, "answer", { type: ans.type, sdp: ans.sdp });
+        } catch (e) {}
+      })();
+      break;
+    case "answer": {
+      const v = voicePeers.get(from);
+      if (v && v.pc.signalingState === "have-local-offer") {
+        v.pc.setRemoteDescription(new RTCSessionDescription(m.data)).catch(() => {});
+      }
+      break;
+    }
+    case "ice": {
+      const v = voicePeers.get(from);
+      if (v) v.pc.addIceCandidate(new RTCIceCandidate(m.data)).catch(() => {});
+      break;
+    }
+    case "leave": {
+      const v = voicePeers.get(from);
+      if (v) {
+        try { v.pc.close(); } catch (e) {}
+        if (v.audio) v.audio.remove();
+        voicePeers.delete(from);
+      }
+      break;
+    }
+  }
 }
