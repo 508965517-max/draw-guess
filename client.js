@@ -385,7 +385,11 @@ function joinAsPlayer(name, code) {
 let helloCount = 0;
 function sendHello() {
   sendToHost({ t: "hello", name: pendingName });
-  if (++helloCount <= 5) setTimeout(() => { if (!joinedConfirmed && roomTopicBase) sendHello(); }, 2500);
+  if (++helloCount <= 5) {
+    setTimeout(() => { if (!joinedConfirmed && roomTopicBase) sendHello(); }, 2500);
+  } else if (!joinedConfirmed && !lobby.classList.contains("hidden")) {
+    lobbyMsg.innerHTML = "⏳ 加入超时：房间在，但房主没有响应。<br>多半是房主页面还是旧版本——请让房主<b>按 Ctrl+F5 强制刷新</b>后重新创建房间，你再加入。";
+  }
 }
 // 房主回传房间信息 -> 弹出加入确认框（含房间名 + 成员名单）
 function showJoinConfirm(roomName, members) {
